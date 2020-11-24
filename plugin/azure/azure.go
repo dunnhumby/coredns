@@ -109,18 +109,21 @@ func (h *Azure) updateZones(ctx context.Context) error {
 		for i, hostedZone := range z {
 			if hostedZone.private {
 				privateSet, err = h.privateClient.List(ctx, hostedZone.id, hostedZone.zone, nil, "")
-				newZ = updateZoneFromPrivateResourceSet(privateSet, zName)
+				if err == nil {
+					newZ, err = updateZoneFromPrivateResourceSet(ctx, privateSet, zName)
+				}
 			} else {
 				publicSet, err = h.publicClient.ListByDNSZone(ctx, hostedZone.id, hostedZone.zone, nil, "")
 				newZ = updateZoneFromPublicResourceSet(publicSet, zName)
 			}
 			if err != nil {
 				errs = append(errs, fmt.Sprintf("failed to list resource records for %v from azure: %v", hostedZone.zone, err))
+			} else {
+				newZ.Upstream = h.upstream
+				h.zMu.Lock()
+				(*z[i]).z = newZ
+				h.zMu.Unlock()
 			}
-			newZ.Upstream = h.upstream
-			h.zMu.Lock()
-			(*z[i]).z = newZ
-			h.zMu.Unlock()
 		}
 	}
 
@@ -220,10 +223,14 @@ func updateZoneFromPublicResourceSet(recordSet publicdns.RecordSetListResultPage
 	return newZ
 }
 
-func updateZoneFromPrivateResourceSet(recordSet privatedns.RecordSetListResultPage, zName string) *file.Zone {
+func updateZoneFromPrivateResourceSet(ctx context.Context, recordSet privatedns.RecordSetListResultPage, zName string) (*file.Zone, error) {
 	newZ := file.NewZone(zName, "")
 
-	for _, result := range *(recordSet.Response().Value) {
+	iter := privatedns.NewRecordSetListResultIterator(recordSet)
+	for iter.NotDone() {
+
+		result := iter.Value()
+
 		resultFqdn := *(result.RecordSetProperties.Fqdn)
 		resultTTL := uint32(*(result.RecordSetProperties.TTL))
 		if result.RecordSetProperties.ARecords != nil {
@@ -297,8 +304,14 @@ func updateZoneFromPrivateResourceSet(recordSet privatedns.RecordSetListResultPa
 			newZ.Insert(cname)
 		}
 
+		err := iter.NextWithContext(ctx)
+
+		if err != nil {
+			return nil, err
+		}
 	}
-	return newZ
+
+	return newZ, nil
 }
 
 // ServeDNS implements the plugin.Handler interface.
